@@ -209,6 +209,7 @@ def usage():
 def main(argv):
     config_filename = ''
     debug_filename = ''
+    build_dir = ''
     try:
         opts, args = getopt.getopt(argv, 'hc:d:b:',
                                    ['help', 'config=', 'debug=', 'builddir='])
