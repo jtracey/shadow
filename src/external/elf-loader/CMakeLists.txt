@@ -5,7 +5,7 @@ add_definitions(-D_GNU_SOURCE)
 add_definitions(-DLDSO_SONAME=\"ldso\")
 
 add_cflags(-g3)
-add_cflags(-O2)
+#add_cflags(-O2)
 add_cflags(-Wall)
 add_cflags(-Wextra)
 #add_cflags(-Werror)
