@@ -223,28 +223,21 @@ vdl_tls_tcb_initialize (unsigned long tcb, unsigned long sysinfo)
 // tls block) and libpthread reads dtv[-1] to find out the size
 // of the dtv array and be able to memset it to zeros.
 // dtv[0] is used as glibc/pthreads' generation counter.
-// the source for the original glibc definition depends on the glibc version
-
-// some macros to define special values in the dtv
-// macros with "ABI" in them are part of the glibc/pthreads ABI
-#define DTV_ABI_GEN(dtv) dtv[0].meta.gen
-// number of actively used elements
-#define DTV_ABI_SIZE(dtv) dtv[-1].meta.nptl
-// size of the buffer allocated
-#define DTV_MEM_SIZE(dtv) dtv[-1].meta.gen
-#define DTV_LOCAL_TLS(dtv) dtv[-2].ptrs.value
-#define DTV_SHADOW_DTV(dtv) dtv[-2].ptrs.to_free
+// Details depend on the glibc version, see comments below.
 
 struct dtv_meta
 {
   unsigned long nptl;
-  unsigned long gen;
+  //ABI < glibc 2.25
+  unsigned long is_static:1;
+  unsigned long gen:(sizeof (unsigned long) * 8 - 1);
 };
 
 struct dtv_ptrs
 {
   void *value;
-  void *to_free; // memory freed by glibc; set to 0 so glibc doesn't touch it
+  // ABI >= glibc 2.25
+  void *to_free;
 };
 
 typedef union dtv
@@ -253,15 +246,55 @@ typedef union dtv
   struct dtv_ptrs ptrs;
 } dtv_t;
 
-// The per-dtvi metadata we use to keep track of updates doesn't fit
-// anywhere in the dtv structs, so we build a shadow dtv that stores it.
-typedef struct shadowdtv
+// some macros to define special values in the dtv
+// macros with "ABI" in them are part of the glibc/pthreads ABI
+#define DTV_ABI_GEN(dtv) dtv[0].meta.gen
+// number of actively used elements
+#define DTV_ABI_SIZE(dtv) dtv[-1].meta.nptl
+// size of the buffer allocated
+#define DTV_MEM_SIZE(dtv) dtv[-1].meta.gen
+// tls for elf-loader to use
+#define DTV_LOCAL_TLS(dtv) dtv[-2].ptrs.value
+
+// we support two ABIs for the dtv, because of the new layout in glibc 2.25
+#if __GLIBC_MINOR__ < 25
+// In older versions, there's a single bit is_static flag we can use,
+// plus store the generation counter in the slack space of the mem-aligned
+// struct. No need for extra structs or functionality.
+typedef dtv_t shadowdtv_t;
+#define DTV_SHADOW_DTV(dtv) dtv
+#define DTV_ALLOCATE_SHADOW(dtv, size)
+#define DTV_MIGRATE_SHADOW(old_dtv, new_dtv, module)
+#define DTV_FREE_SHADOW(dtv)
+#define DTV_ABI_SET_TO_FREE(dtv, module)
+#else
+// From 25 on, the dtv struct replaces the "is_static" flag with a "to_free"
+// field to keep track of the unaligned memory to call free() on.
+// This causes two problems.
+// One: we no longer have room in the dtv to store our metadata.
+// We solve this by adding a "shadow" dtv that stores the fields that used to
+// be in the dtv itself.
+typedef union shadowdtv
 {
-  // we use the upper bit as an "is static" flag, to cut the size in half
-  // this introduces an overflow bug, but 2^63 should be enough generations
-  unsigned long is_static:1;
-  unsigned long gen:(sizeof (unsigned long) * 8 - 1);
+  struct
+  {
+    unsigned long is_static:1; // width isn't for an ABI, it just saves space
+    unsigned long gen:(sizeof (unsigned long) * 8 - 1);
+  } meta;
 } shadowdtv_t;
+#define DTV_SHADOW_DTV(dtv) dtv[-2].ptrs.to_free
+#define DTV_ALLOCATE_SHADOW(dtv, size)          \
+  DTV_SHADOW_DTV(dtv) = vdl_alloc_malloc (size)
+#define DTV_FREE_SHADOW(dtv) vdl_alloc_free (DTV_SHADOW_DTV(dtv))
+#define DTV_MIGRATE_SHADOW(new_dtv, old_dtv, module)    \
+  ((shadowdtv_t *) DTV_SHADOW_DTV(new_dtv))[module] =   \
+    ((shadowdtv_t *) DTV_SHADOW_DTV(old_dtv))[module]
+// Two: glibc's free() isn't our internal free(), and has an incompatible ABI.
+// Since it's us who allocates the TLS, we can't let glibc clean it up.
+// We make sure to always set the "to_free" field to 0, which free() ignores.
+#define DTV_ABI_SET_TO_FREE(dtv, module)        \
+  dtv[module].ptrs.to_free = 0
+#endif
 
 static inline dtv_t *
 get_current_dtv (unsigned long tp)
@@ -307,7 +340,7 @@ vdl_tls_dtv_allocate (unsigned long tcb)
       DTV_LOCAL_TLS(new_dtv) = local_tls;
       DTV_MEM_SIZE(new_dtv) = 2 * needed_size;
       // Must always be the same size as the real dtv.
-      DTV_SHADOW_DTV(new_dtv) = vdl_alloc_malloc (2 * needed_size);
+      DTV_ALLOCATE_SHADOW(new_dtv, 2 * needed_size);
       set_current_dtv (tcb, new_dtv);
     }
   else
@@ -323,12 +356,10 @@ vdl_tls_dtv_allocate (unsigned long tcb)
     {
       unsigned long module;
       // copy over the data from the old dtv into the new one.
-      shadowdtv_t *new_shadow = DTV_SHADOW_DTV(new_dtv);
-      shadowdtv_t *old_shadow = DTV_SHADOW_DTV(current_dtv);
       for (module = 1; module <= DTV_ABI_SIZE(current_dtv); module++)
         {
           new_dtv[module] = current_dtv[module];
-          new_shadow[module] = old_shadow[module];
+          DTV_MIGRATE_SHADOW(new_dtv, current_dtv, module);
         }
       // clear the old dtv
       vdl_alloc_free (&current_dtv[-2]);
@@ -353,8 +384,7 @@ vdl_tls_dtv_initialize (unsigned long tcb)
             {
               void *dtvi = (void *)tcb + cur->tls_offset;
               dtv[cur->tls_index].ptrs.value = dtvi;
-              dtv[cur->tls_index].ptrs.to_free = 0;
-              shadow_dtv[cur->tls_index].is_static = 1;
+              shadow_dtv[cur->tls_index].meta.is_static = 1;
               // copy the template in the module tls block
               vdl_memcpy ((void *) dtvi, (void *) cur->tls_tmpl_start,
                           cur->tls_tmpl_size);
@@ -364,11 +394,11 @@ vdl_tls_dtv_initialize (unsigned long tcb)
           else
             {
               dtv[cur->tls_index].ptrs.value = 0;    // unallocated
-              dtv[cur->tls_index].ptrs.to_free = 0;
-              shadow_dtv[cur->tls_index].is_static = 0;
+              shadow_dtv[cur->tls_index].meta.is_static = 0;
             }
+          DTV_ABI_SET_TO_FREE(dtv, cur->tls_index);
           shadowdtv_t *shadow_dtv = DTV_SHADOW_DTV(dtv);
-          shadow_dtv[cur->tls_index].gen = cur->tls_tmpl_gen;
+          shadow_dtv[cur->tls_index].meta.gen = cur->tls_tmpl_gen;
         }
     }
   // initialize its generation counter
@@ -423,7 +453,7 @@ vdl_tls_dtv_deallocate (unsigned long tcb)
           // this was an unallocated entry
           continue;
         }
-      if (shadow_dtv[module].is_static)
+      if (shadow_dtv[module].meta.is_static)
         {
           // this was a static entry so, we don't
           // have anything to free here.
@@ -437,6 +467,7 @@ vdl_tls_dtv_deallocate (unsigned long tcb)
   // But it's possible that it has allocated memory that will be used/freed
   // later, on some other thread, so we can't.
   vdl_alloc_free ((struct LocalTLS *) DTV_LOCAL_TLS(dtv));
+  DTV_FREE_SHADOW(dtv);
   vdl_alloc_free (&dtv[-2]);
 }
 
@@ -503,9 +534,9 @@ vdl_tls_dtv_update_new (dtv_t *new_dtv, unsigned long dtv_size,
   for (module = dtv_size + 1; module <= new_dtv_size; module++)
     {
       new_dtv[module].ptrs.value = 0;
-      new_dtv[module].ptrs.to_free = 0;
-      new_shadow_dtv[module].gen = 0;
-      new_shadow_dtv[module].is_static = 0;
+      DTV_ABI_SET_TO_FREE(new_dtv, module);
+      new_shadow_dtv[module].meta.gen = 0;
+      new_shadow_dtv[module].meta.is_static = 0;
       struct VdlFile *file = find_file_by_module (module);
       if (file == 0)
         {
@@ -518,8 +549,8 @@ vdl_tls_dtv_update_new (dtv_t *new_dtv, unsigned long dtv_size,
         {
           void *dtvi = (void *)tcb + file->tls_offset;
           new_dtv[file->tls_index].ptrs.value = dtvi;
-          new_shadow_dtv[file->tls_index].is_static = 1;
-          new_shadow_dtv[file->tls_index].gen = file->tls_tmpl_gen;
+          new_shadow_dtv[file->tls_index].meta.is_static = 1;
+          new_shadow_dtv[file->tls_index].meta.gen = file->tls_tmpl_gen;
           // copy the template in the module tls block
           vdl_memcpy (dtvi, (void *) file->tls_tmpl_start,
                       file->tls_tmpl_size);
@@ -621,9 +652,9 @@ vdl_tls_get_addr_slow (unsigned long module, unsigned long offset)
                   0, file->tls_init_zero_size);
       // finally, update the dtv
       dtv[module].ptrs.value = dtvi;
-      dtv[module].ptrs.to_free = 0;
-      shadow_dtv[module].gen = file->tls_tmpl_gen;
-      shadow_dtv[module].is_static = 0;
+      DTV_ABI_SET_TO_FREE(dtv, module);
+      shadow_dtv[module].meta.gen = file->tls_tmpl_gen;
+      shadow_dtv[module].meta.is_static = 0;
       // and return the requested value
       read_unlock (g_vdl.tls_lock);
       return dtv[module].ptrs.value + offset;
