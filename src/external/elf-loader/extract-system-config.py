@@ -196,6 +196,8 @@ def search_debug_file():
 def list_lib_path():
     paths = []
     re_lib = re.compile ('(?<=^#)')
+    if not os.path.isdir("/etc/ld.so.conf.d/"):
+        return ''
     for filename in os.listdir("/etc/ld.so.conf.d/"):
         try:
             for line in open ("/etc/ld.so.conf.d/" + filename, 'r'):
