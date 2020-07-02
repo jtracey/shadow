@@ -12,6 +12,9 @@ int dl_lmid_swap_tls (Lmid_t lmid, pthread_t *t1, pthread_t *t2);
 // dl(m)open() flag. Specifies that the loaded file should be placed in load
 // order as though it were added via LD_PRELOAD, in this context only.
 #define RTLD_INTERPOSE 0x00040
+// dl(m)open() flag. Disables running the init function of the loaded file
+// as well as any of its dependencies (during the course of this load).
+#define RTLD_NOINIT 0x00080
 
 // dlinfo() flag. Populates info field with the size of the currently used
 // static TLS.
